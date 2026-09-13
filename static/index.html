@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HE400se 均衡器控制面板</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 12h2l2-7 3 14 3-10 2 5 2-2h4"/>
+    </svg>
+    <div>
+      <h1>HE400se 均衡器控制面板</h1>
+      <p class="sub">PipeWire 参数均衡 · PARA II 目标曲线</p>
+    </div>
+  </div>
+  <div id="svc-badge" class="badge badge-gray"><span class="dot"></span><span id="svc-text">检测中…</span></div>
+</header>
+
+<main class="layout">
+  <!-- 左列 -->
+  <section class="col-left">
+
+    <div class="card card-toggle">
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">均衡器</div>
+          <div id="toggle-state" class="toggle-state off">已关闭</div>
+        </div>
+        <button type="button" id="eq-toggle" class="switch" role="switch" aria-checked="false" aria-label="开启或关闭均衡器">
+          <span class="knob"></span>
+        </button>
+      </div>
+      <p class="caption">当前输出：<span id="toggle-device">—</span></p>
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">输出设备</h2>
+      <ul id="device-list" class="device-list"></ul>
+    </div>
+
+    <div class="card">
+      <div class="preset-head">
+        <h2 class="card-title">EQ 预设</h2>
+        <div class="preset-actions">
+          <button type="button" id="preset-new" class="btn btn-ghost btn-sm" title="新建预设">＋ 新建</button>
+          <button type="button" id="preset-import" class="btn btn-ghost btn-sm" title="解析文本并填入编辑器">导入到当前</button>
+          <button type="button" id="preset-delete" class="btn btn-ghost btn-danger btn-sm">删除</button>
+        </div>
+      </div>
+      <ul id="preset-list" class="preset-list"></ul>
+    </div>
+
+    <div class="card">
+      <div class="vol-head">
+        <h2 class="card-title">音量</h2>
+        <span id="vol-value" class="vol-num">—</span>
+      </div>
+      <div id="vol-eq-row" class="vol-row vol-sub hidden">
+        <div class="vol-label">
+          <span id="vol-eq-name" class="vol-name">—</span>
+          <span id="vol-eq-val" class="vol-sub-val">—</span>
+        </div>
+        <input id="vol-slider-eq" class="slider" type="range" min="0" max="100" step="1" value="100" aria-label="EQ 音量">
+      </div>
+      <div class="vol-row">
+        <div id="vol-phys-label" class="vol-label hidden">
+          <span class="vol-name">Family 输出</span>
+          <span class="vol-sub-val"><span id="vol-phys-desc">—</span> · <span id="vol-phys-val">—</span></span>
+        </div>
+        <input id="vol-slider-phys" class="slider" type="range" min="0" max="100" step="1" value="100" aria-label="物理输出音量">
+        <button type="button" id="mute-btn" class="btn btn-ghost btn-mute" aria-label="静音切换">静音</button>
+      </div>
+      <p id="vol-via" class="caption vol-via hidden">实际输出：<span id="vol-via-name">—</span></p>
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">filter-chain 服务</h2>
+      <div class="svc-btns">
+        <button type="button" class="btn btn-ghost" data-action="start">启动</button>
+        <button type="button" class="btn btn-ghost btn-danger" data-action="stop">停止</button>
+        <button type="button" class="btn btn-ghost" data-action="restart">重启</button>
+      </div>
+      <div class="svc-repair">
+        <button type="button" id="repair-btn" class="btn btn-ghost btn-sm">修复链路</button>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- 右列 -->
+  <section class="col-right">
+
+    <div class="card">
+      <div class="curve-head">
+        <h2 class="card-title">频率响应</h2>
+        <span class="curve-note">20 Hz – 20 kHz · 实时预览</span>
+      </div>
+      <canvas id="curve" height="260"></canvas>
+    </div>
+
+    <div class="card">
+      <div class="editor-head">
+        <div class="editor-title-box">
+          <h2 class="card-title" id="editor-title">均衡器参数</h2>
+          <span id="preset-name" class="preset-name">—</span>
+        </div>
+        <div class="preamp-box">
+          <label for="preamp">前置增益 dB</label>
+          <input id="preamp" type="number" min="-24" max="0" step="0.1" value="-8.6">
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="band-table">
+          <thead>
+            <tr><th class="c-idx">#</th><th>频率 Hz</th><th>Q</th><th class="c-gain">增益 dB</th></tr>
+          </thead>
+          <tbody id="band-body"></tbody>
+        </table>
+      </div>
+      <div class="editor-foot">
+        <button type="button" id="apply-btn" class="btn btn-primary">应用</button>
+        <button type="button" id="revert-btn" class="btn btn-ghost">还原</button>
+      </div>
+    </div>
+
+  </section>
+</main>
+
+<div id="modal-root" class="modal-root hidden" aria-hidden="true">
+  <div class="modal-backdrop" id="modal-backdrop"></div>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head">
+      <h3 id="modal-title">新建预设</h3>
+      <button type="button" id="modal-close" class="btn btn-ghost modal-x" aria-label="关闭">×</button>
+    </div>
+    <div id="modal-name-row" class="modal-row">
+      <label for="modal-name">预设名称</label>
+      <input id="modal-name" type="text" maxlength="50" placeholder="例如：测试曲线" autocomplete="off">
+    </div>
+    <textarea id="modal-text" class="modal-text" rows="8" wrap="off" spellcheck="false"
+      placeholder="类型=峰值 频率=5725Hz Gain=1.621549 Q=5（每行一条）"></textarea>
+    <div class="modal-row modal-parse-row">
+      <button type="button" id="modal-parse" class="btn btn-ghost">解析</button>
+      <span id="modal-result" class="modal-result"></span>
+    </div>
+    <div class="modal-row">
+      <label for="modal-preamp">预增益 dB</label>
+      <input id="modal-preamp" type="number" min="-24" max="0" step="0.1" value="0">
+    </div>
+    <div class="modal-foot">
+      <button type="button" id="modal-create" class="btn btn-primary" disabled>创建</button>
+      <button type="button" id="modal-fill" class="btn btn-ghost" disabled>填入编辑器</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast-root" class="toast-root" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

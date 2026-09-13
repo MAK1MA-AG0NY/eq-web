@@ -1,0 +1,10 @@
+[Unit]
+Description=EQ Web Control Panel (HE400se PARA II)
+After=pipewire.service wireplumber.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/mak1ma/eq-web/server.py
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

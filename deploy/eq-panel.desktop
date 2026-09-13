@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EQ 控制面板
+Comment=HE400se PARA II 参数均衡器控制面板
+Exec=/bin/bash -c "systemctl --user start eq-web.service; xdg-open http://127.0.0.1:8787"
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Audio;
