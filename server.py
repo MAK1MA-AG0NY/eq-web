@@ -93,22 +93,65 @@ def must_run(args, timeout=5):
 
 # ---------------------------------------------------------------- sinks
 
-def pw_dump():
-    rc, out, err = run(["pw-dump"])
-    if rc != 0:
-        raise ApiError(f"pw-dump 失败: {err.strip() or out.strip()}")
+_PW_DUMP_CACHE = {"t": 0.0, "data": None}
+_PW_DUMP_TTL = 0.25   # 秒: 一次用户操作里常常连调多次, 缓存可避免反复 dump 822KB
+
+
+def pw_dump(force=False):
+    """返回 PipeWire 图的扁平对象列表。
+
+    坑: pw-dump 在 **dump 期间有节点增删** 时会输出**多个 JSON 数组拼接**,
+    例如主 dump 后面再跟一个 [{id, info: null}] 的增量块。
+    直接 json.loads 会以 "Extra data" 失败 —— 而这与负载无关, 属于必然发生的
+    情况 (创建预设、切换设备时图都在变)。所以这里用 raw_decode 逐段解析,
+    按 id 合并, info 为 null 视为该对象已消失。
+
+    另加 0.25s 短缓存: 一次切换会调用本函数多次, 而单次 dump 有 822KB。
+    """
+    now = time.time()
+    if (not force and _PW_DUMP_CACHE["data"] is not None
+            and now - _PW_DUMP_CACHE["t"] < _PW_DUMP_TTL):
+        return _PW_DUMP_CACHE["data"]
+
     last = None
-    for attempt in range(3):
+    for attempt in range(4):
+        rc, out, err = run(["pw-dump"], timeout=20)
+        if rc != 0:
+            last = f"pw-dump 退出码 {rc}: {(err or out).strip()[:200]}"
+            time.sleep(0.25)
+            continue
         try:
-            return json.loads(out)
-        except json.JSONDecodeError as e:
+            dec = json.JSONDecoder()
+            txt = out.lstrip()
+            idx, merged, seen = 0, {}, 0
+            while True:
+                while idx < len(txt) and txt[idx] in " \t\r\n":
+                    idx += 1
+                if idx >= len(txt):
+                    break
+                obj, idx = dec.raw_decode(txt, idx)
+                seen += 1
+                if isinstance(obj, list):
+                    for item in obj:
+                        if not isinstance(item, dict):
+                            continue
+                        oid = item.get("id")
+                        if oid is None:
+                            continue
+                        if item.get("info") is None:
+                            merged.pop(oid, None)   # 增量块表示该对象已消失
+                        else:
+                            merged[oid] = item
+            if seen == 0:
+                raise ValueError("pw-dump 输出为空")
+            data = list(merged.values())
+            _PW_DUMP_CACHE["t"] = time.time()
+            _PW_DUMP_CACHE["data"] = data
+            return data
+        except (json.JSONDecodeError, ValueError) as e:
             last = e
-            if attempt < 2:
-                time.sleep(0.2)
-                rc, out, err = run(["pw-dump"])
-                if rc != 0:
-                    raise ApiError(f"pw-dump 失败: {err.strip() or out.strip()}")
-    raise ApiError(f"pw-dump 输出解析失败: {last} (已重试 3 次)")
+            time.sleep(0.25)
+    raise ApiError(f"pw-dump 输出解析失败: {last} (已重试 4 次)")
 
 
 def _sinks_from_dump(data):
@@ -461,17 +504,79 @@ def capture_eq_memory(sinks):
         remember_preset_volume(cur)
 
 
-def after_default_switch(target):
-    """Post-switch housekeeping: restore the target mode's remembered volumes
-    (EQ device + Family) and repair links."""
-    time.sleep(0.3)  # let WirePlumber start re-routing
-    sinks = list_sinks()
-    if is_eq_name(target["name"]):
-        fresh = next((s for s in sinks if s["name"] == target["name"]), None)
-        if fresh is not None:
-            apply_preset_volume(fresh)
-    repair_links()
-    apply_family_memory(target["name"], list_sinks())
+def _preset_by_node(node_name):
+    """按 node.name 找预设信息。"""
+    if not node_name:
+        return None
+    for f in list_preset_files():
+        try:
+            info = read_preset(f)
+        except ApiError:
+            continue
+        if info.get("node_name") == node_name:
+            return info
+    return None
+
+
+def mode_preamp_db(node_name):
+    """该模式的内部预增益 (dB)。
+
+    EQ 预设取 conf 里的 preamp; 直通/物理设备没有增益级, 返回 0。
+    """
+    if not node_name or not is_eq_name(node_name):
+        return 0.0
+    info = _preset_by_node(node_name)
+    if not info:
+        return 0.0
+    try:
+        return float(info.get("preamp_db") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def after_default_switch(target, sinks=None):
+    """切换默认输出, 保证任何瞬间都不会比目标更响。
+
+    背景: 预设的 preamp 是 filter-chain 图内的**静态乘数, 没有斜坡**, 而物理音量
+    是带过渡的。若切换时物理音量还没补偿到位, 就会出现"先突然大声再变小声"。
+
+    做法 (不依赖方向判断, 因此更稳): 切换前先把物理音量压到
+    **当前值与目标值中较低的那个**。这样:
+
+      * 新模式内部更响 (目标音量更低) -> 已先降到目标值, 切换即正确
+      * 新模式内部更轻 (目标音量更高) -> 切换瞬间偏安静, 随后再升上去
+
+    两种情况的共同点是: 任何瞬间都不会比目标更响, 最坏只是短暂偏安静
+    (不刺耳、不伤听力)。方向判断需要读当前默认设备, 而那次读取在负载下可能
+    失败; 用 min() 就完全绕开了这个不确定性。
+    """
+    if sinks is None:
+        sinks = list_sinks()
+
+    # 新模式自身的音量: 节点已存在, 提前设好, 流搬过去时电平就是对的
+    fresh = next((s for s in sinks if s["name"] == target["name"]), None)
+    if fresh is not None:
+        apply_preset_volume(fresh)
+
+    v_new = (load_state().get("family_volumes") or {}).get(target["name"])
+    phys = physical_for_mode(target["name"], sinks)
+    ok = (phys is not None and isinstance(v_new, (int, float))
+          and 0.0 < v_new <= 1.5)
+
+    if ok:
+        cur, _ = wp_volume(phys["id"])
+        pre = min(cur, float(v_new))
+        if cur > 0 and pre < cur - 1e-6:
+            # 先压下去 (此刻旧预设短暂偏安静, 绝不会爆音)
+            run(["wpctl", "set-volume", str(phys["id"]), f"{pre:.4f}"])
+        set_default_sink(target["id"])
+        run(["wpctl", "set-volume", str(phys["id"]), f"{float(v_new):.4f}"])
+    else:
+        set_default_sink(target["id"])
+
+    record_default_choice(target)
+    time.sleep(0.15)      # 等 WirePlumber 搬流; 此刻音量已正确, 不影响响度
+    return repair_links()
 
 
 # ---------------------------------------------------------------- link repair
@@ -1203,7 +1308,7 @@ def handle_post(path, body):
         capture_family_memory(sinks)
         set_default_sink(sink_id)
         record_default_choice(target)
-        after_default_switch(target)
+        after_default_switch(target, sinks)
         return status_payload()
 
     if path == "/api/eq/toggle":
@@ -1220,7 +1325,7 @@ def handle_post(path, body):
         capture_family_memory(sinks)
         set_default_sink(target["id"])
         record_default_choice(target)
-        after_default_switch(target)
+        after_default_switch(target, sinks)
         return status_payload()
 
     if path == "/api/eq":
