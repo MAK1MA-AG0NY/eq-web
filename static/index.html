@@ -47,6 +47,7 @@
         <h2 class="card-title">EQ 预设</h2>
         <div class="preset-actions">
           <button type="button" id="preset-new" class="btn btn-ghost btn-sm" title="新建预设">＋ 新建</button>
+          <button type="button" id="preset-sim" class="btn btn-ghost btn-sm" title="用两副耳机的频响曲线生成 EQ">🎧 模拟耳机</button>
           <button type="button" id="preset-import" class="btn btn-ghost btn-sm" title="解析文本并填入编辑器">导入到当前</button>
           <button type="button" id="preset-delete" class="btn btn-ghost btn-danger btn-sm">删除</button>
         </div>
@@ -68,8 +69,8 @@
       </div>
       <div class="vol-row">
         <div id="vol-phys-label" class="vol-label hidden">
-          <span class="vol-name">Family 输出</span>
-          <span class="vol-sub-val"><span id="vol-phys-desc">—</span> · <span id="vol-phys-val">—</span></span>
+          <span id="vol-phys-name" class="vol-name">输出</span>
+          <span class="vol-sub-val"><span id="vol-phys-val">—</span></span>
         </div>
         <input id="vol-slider-phys" class="slider" type="range" min="0" max="100" step="1" value="100" aria-label="物理输出音量">
         <button type="button" id="mute-btn" class="btn btn-ghost btn-mute" aria-label="静音切换">静音</button>
@@ -107,6 +108,12 @@
         <div class="editor-title-box">
           <h2 class="card-title" id="editor-title">均衡器参数</h2>
           <span id="preset-name" class="preset-name">—</span>
+        </div>
+        <div class="output-target-box">
+          <label for="output-target">输出目标</label>
+          <select id="output-target" title="该预设的均衡输出路由到哪个物理设备">
+            <option value="auto">自动</option>
+          </select>
         </div>
         <div class="preamp-box">
           <label for="preamp">前置增益 dB</label>
@@ -154,6 +161,88 @@
     <div class="modal-foot">
       <button type="button" id="modal-create" class="btn btn-primary" disabled>创建</button>
       <button type="button" id="modal-fill" class="btn btn-ghost" disabled>填入编辑器</button>
+    </div>
+  </div>
+</div>
+
+<div id="sim-root" class="modal-root hidden" aria-hidden="true">
+  <div class="modal-backdrop" id="sim-backdrop"></div>
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="sim-title">
+    <div class="modal-head">
+      <h3 id="sim-title">耳机模拟</h3>
+      <button type="button" id="sim-close" class="btn btn-ghost modal-x" aria-label="关闭">×</button>
+    </div>
+
+    <p class="sim-hint">
+      先选测量源。两副耳机必须来自<b>同一个源</b> —— 不同源的曲线不能混用，
+      否则结果里混进的是测量设备的差异，而不是耳机本身的差异。
+    </p>
+
+    <div class="modal-row">
+      <label for="sim-source">测量源</label>
+      <select id="sim-source"><option value="">加载中…</option></select>
+    </div>
+
+    <div class="sim-pair">
+      <div class="sim-pair-col">
+        <label for="sim-from">我的耳机（要被调整的）</label>
+        <input id="sim-from-search" class="sim-search" type="search" placeholder="搜索…" autocomplete="off">
+        <select id="sim-from" size="7"></select>
+      </div>
+      <div class="sim-pair-col">
+        <label for="sim-to">目标耳机（要模拟的）</label>
+        <input id="sim-to-search" class="sim-search" type="search" placeholder="搜索…" autocomplete="off">
+        <select id="sim-to" size="7"></select>
+      </div>
+    </div>
+
+    <details class="sim-find">
+      <summary>不知道用哪个源？点这里「找同源」</summary>
+      <div class="sim-find-row">
+        <input id="sim-find-input" type="search" placeholder="输入耳机型号，如 HE400se" autocomplete="off">
+        <button type="button" id="sim-find-btn" class="btn btn-ghost btn-sm">查找</button>
+      </div>
+      <div id="sim-find-result" class="sim-find-result"></div>
+    </details>
+
+    <div class="sim-params">
+      <div>
+        <label for="sim-bands">段数</label>
+        <input id="sim-bands" type="number" min="1" max="128" step="1" value="10">
+      </div>
+      <div>
+        <label for="sim-treble">高频策略</label>
+        <select id="sim-treble">
+          <option value="shelf">保守（高频不硬追）</option>
+          <option value="match">完全跟目标（更准，需更多余量）</option>
+          <option value="ignore">完全不修正高频</option>
+        </select>
+      </div>
+      <div>
+        <label for="sim-bass">低频增益 dB</label>
+        <input id="sim-bass" type="number" min="-24" max="24" step="0.5" value="0">
+      </div>
+    </div>
+
+    <div class="modal-row modal-parse-row">
+      <button type="button" id="sim-run" class="btn btn-primary">开始模拟</button>
+      <span id="sim-status" class="modal-result"></span>
+    </div>
+
+    <div id="sim-metrics" class="sim-metrics hidden"></div>
+
+    <div class="modal-row">
+      <label for="sim-name">预设名称</label>
+      <input id="sim-name" type="text" maxlength="50" placeholder="例如：HE400se → HE1000 Unveiled" autocomplete="off">
+    </div>
+    <div class="modal-row">
+      <label for="sim-preamp">预增益 dB</label>
+      <input id="sim-preamp" type="number" min="-24" max="0" step="0.1" value="0">
+    </div>
+
+    <div class="modal-foot">
+      <button type="button" id="sim-create" class="btn btn-primary" disabled>创建预设</button>
+      <button type="button" id="sim-fill" class="btn btn-ghost" disabled>填入编辑器</button>
     </div>
   </div>
 </div>

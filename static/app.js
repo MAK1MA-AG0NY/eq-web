@@ -36,7 +36,7 @@
     volEqVal: $("vol-eq-val"),
     volSliderEq: $("vol-slider-eq"),
     volPhysLabel: $("vol-phys-label"),
-    volPhysDesc: $("vol-phys-desc"),
+    volPhysName: $("vol-phys-name"),
     volPhysVal: $("vol-phys-val"),
     volSliderPhys: $("vol-slider-phys"),
     volVia: $("vol-via"),
@@ -44,6 +44,7 @@
     muteBtn: $("mute-btn"),
     repairBtn: $("repair-btn"),
     preamp: $("preamp"),
+    outputTarget: $("output-target"),
     bandBody: $("band-body"),
     applyBtn: $("apply-btn"),
     revertBtn: $("revert-btn"),
@@ -92,6 +93,7 @@
   let eqData = null; // {file, description, preamp_db, bands:[{freq,q,gain,type}]}
   let presets = []; // from /api/eqs
   let currentFile = null; // preset file being edited
+  let outputsCache = []; // physical output devices for the target selector
   let parsedResult = null; // successful /api/eq/parse result in modal
   let applying = false;
 
@@ -103,6 +105,47 @@
     activating: "服务启动中",
     unknown: "服务状态未知",
   };
+
+  let deviceCollapsed = new Set();
+
+  function buildDeviceItem(d) {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "device-item" + (d.is_default ? " is-default" : "");
+    const body = document.createElement("span");
+    body.className = "d-body";
+    const name = document.createElement("span");
+    name.className = "d-name";
+    name.textContent = d.description || d.name;
+    const sub = document.createElement("span");
+    sub.className = "d-sub";
+    sub.textContent = d.name;
+    body.append(name, sub);
+    btn.appendChild(body);
+    if (d.is_eq) {
+      const tag = document.createElement("span");
+      tag.className = "tag tag-eq";
+      tag.textContent = "EQ";
+      btn.appendChild(tag);
+    }
+    if (d.is_default) {
+      const tag = document.createElement("span");
+      tag.className = "tag tag-default";
+      tag.textContent = "默认";
+      btn.appendChild(tag);
+    }
+    btn.addEventListener("click", guard(async () => {
+      await api("/api/sink/default", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: d.id }),
+      });
+      await refreshStatus();
+    }));
+    li.appendChild(btn);
+    return li;
+  }
 
   function renderStatus() {
     if (!status) return;
@@ -119,45 +162,64 @@
       ? status.default_sink.description || status.default_sink.name
       : "—";
 
-    // device list
     el.deviceList.innerHTML = "";
+    const groups = new Map();
+    for (const o of outputsCache) {
+      groups.set(o.name, { key: o.name, label: o.description || o.name, items: [] });
+    }
+    let autoGroup = null;
     for (const d of status.sinks) {
-      const li = document.createElement("li");
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "device-item" + (d.is_default ? " is-default" : "");
-      const body = document.createElement("span");
-      body.className = "d-body";
-      const name = document.createElement("span");
-      name.className = "d-name";
-      name.textContent = d.description || d.name;
-      const sub = document.createElement("span");
-      sub.className = "d-sub";
-      sub.textContent = d.name;
-      body.append(name, sub);
-      btn.appendChild(body);
-      if (d.is_eq) {
-        const tag = document.createElement("span");
-        tag.className = "tag tag-eq";
-        tag.textContent = "EQ";
-        btn.appendChild(tag);
+      if (!d.is_eq) {
+        let g = groups.get(d.name);
+        if (!g) {
+          g = { key: d.name, label: d.description || d.name, items: [] };
+          groups.set(d.name, g);
+        }
+        g.items.push(d);
+      } else {
+        const p = presets.find((x) => x.node_name === d.name);
+        const g = p && p.target ? groups.get(p.target) : null;
+        if (g) {
+          g.items.push(d);
+        } else {
+          if (!autoGroup) autoGroup = { key: "__auto__", label: "自动", items: [] };
+          autoGroup.items.push(d);
+        }
       }
-      if (d.is_default) {
-        const tag = document.createElement("span");
-        tag.className = "tag tag-default";
-        tag.textContent = "默认";
-        btn.appendChild(tag);
+    }
+    const ordered = [...groups.values()].filter((g) => g.items.length);
+    if (autoGroup) ordered.push(autoGroup);
+    for (const g of ordered) {
+      const groupLi = document.createElement("li");
+      groupLi.className = "preset-group";
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className =
+        "preset-group-head" + (deviceCollapsed.has(g.key) ? " is-collapsed" : "");
+      head.title = g.label;
+      const caret = document.createElement("span");
+      caret.className = "g-caret";
+      caret.textContent = "▾";
+      const gname = document.createElement("span");
+      gname.className = "g-name";
+      gname.textContent = g.label;
+      const count = document.createElement("span");
+      count.className = "g-count";
+      count.textContent = `${g.items.length}`;
+      head.append(caret, gname, count);
+      head.addEventListener("click", () => {
+        if (deviceCollapsed.has(g.key)) deviceCollapsed.delete(g.key);
+        else deviceCollapsed.add(g.key);
+        renderStatus();
+      });
+      groupLi.appendChild(head);
+      if (!deviceCollapsed.has(g.key)) {
+        const ul = document.createElement("ul");
+        ul.className = "preset-sub-list";
+        for (const d of g.items) ul.appendChild(buildDeviceItem(d));
+        groupLi.appendChild(ul);
       }
-      btn.addEventListener("click", guard(async () => {
-        await api("/api/sink/default", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: d.id }),
-        });
-        await refreshStatus();
-      }));
-      li.appendChild(btn);
-      el.deviceList.appendChild(li);
+      el.deviceList.appendChild(groupLi);
     }
 
     // volume (skip rows currently being dragged)
@@ -173,15 +235,16 @@
       el.volVia.classList.toggle("hidden", !(via && v.physical));
       if (via && v.physical) {
         el.volViaName.textContent = v.physical.description || v.physical.name;
+        el.volPhysName.textContent = v.physical.description || v.physical.name;
       }
       if (via && v.eq) {
         el.volEqName.textContent = v.eq.description || v.eq.name;
         if (!volDrag.eq) setRowVolume(el.volSliderEq, el.volEqVal, v.eq);
       }
       if (v.physical && !volDrag.physical) {
-        el.volPhysDesc.textContent = v.physical.description || v.physical.name;
         setRowVolume(el.volSliderPhys, el.volPhysVal, v.physical);
-      }      el.muteBtn.classList.toggle("is-muted", !!v.muted);
+      }
+      el.muteBtn.classList.toggle("is-muted", !!v.muted);
       el.muteBtn.textContent = v.muted ? "取消静音" : "静音";
     }
   }
@@ -296,6 +359,32 @@
 
   // ---------- preset management ----------
 
+  async function refreshOutputs() {
+    const data = await api("/api/outputs");
+    outputsCache = data.outputs || [];
+    rebuildOutputSelect();
+  }
+
+  function rebuildOutputSelect() {
+    const sel = el.outputTarget;
+    sel.innerHTML = "";
+    const auto = document.createElement("option");
+    auto.value = "auto";
+    auto.textContent = "自动";
+    sel.appendChild(auto);
+    for (const o of outputsCache) {
+      const opt = document.createElement("option");
+      opt.value = o.name;
+      opt.textContent = o.description || o.name;
+      sel.appendChild(opt);
+    }
+  }
+
+  function syncOutputSelect() {
+    const p = presets.find((x) => x.file === currentFile);
+    el.outputTarget.value = p && p.target ? p.target : "auto";
+  }
+
   async function refreshPresets() {
     const data = await api("/api/eqs");
     presets = data.presets || [];
@@ -303,39 +392,149 @@
     renderPresets();
   }
 
+  function buildPresetItem(p) {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "preset-item" + (p.file === currentFile ? " is-current" : "");
+    btn.title = p.file;
+    const body = document.createElement("span");
+    body.className = "p-body";
+    const name = document.createElement("span");
+    name.className = "p-name";
+    name.textContent = p.description || p.file;
+    const sub = document.createElement("span");
+    sub.className = "p-sub";
+    sub.textContent = p.file;
+    body.append(name, sub);
+    const bands = document.createElement("span");
+    bands.className = "tag-bands";
+    bands.textContent = `${p.bands} 段`;
+    btn.append(body, bands);
+    if (p.sink && p.sink.loaded) {
+      const loaded = document.createElement("span");
+      loaded.className = "p-loaded";
+      loaded.textContent = "已加载";
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      loaded.prepend(dot);
+      btn.appendChild(loaded);
+    }
+    btn.addEventListener("click", guard(() => selectPreset(p.file)));
+    li.draggable = true;
+    li.addEventListener("dragstart", (e) => {
+      dragPresetFile = p.file;
+      e.dataTransfer.setData("text/plain", p.file);
+      e.dataTransfer.effectAllowed = "move";
+      li.classList.add("is-dragging");
+    });
+    li.addEventListener("dragend", () => {
+      dragPresetFile = null;
+      li.classList.remove("is-dragging");
+      document
+        .querySelectorAll(".preset-group.drop-target")
+        .forEach((n) => {
+          n.classList.remove("drop-target");
+        });
+    });
+    li.appendChild(btn);
+    return li;
+  }
+
+  let dragPresetFile = null;
+  let collapsedGroups = new Set();
+
   function renderPresets() {
     el.presetList.innerHTML = "";
+    const groups = new Map();
     for (const p of presets) {
-      const li = document.createElement("li");
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "preset-item" + (p.file === currentFile ? " is-current" : "");
-      btn.title = p.file;
-      const body = document.createElement("span");
-      body.className = "p-body";
-      const name = document.createElement("span");
-      name.className = "p-name";
-      name.textContent = p.description || p.file;
-      const sub = document.createElement("span");
-      sub.className = "p-sub";
-      sub.textContent = p.file;
-      body.append(name, sub);
-      const bands = document.createElement("span");
-      bands.className = "tag-bands";
-      bands.textContent = `${p.bands} 段`;
-      btn.append(body, bands);
-      if (p.sink && p.sink.loaded) {
-        const loaded = document.createElement("span");
-        loaded.className = "p-loaded";
-        loaded.textContent = "已加载";
-        const dot = document.createElement("span");
-        dot.className = "dot";
-        loaded.prepend(dot);
-        btn.appendChild(loaded);
+      const key = p.target || "__auto__";
+      if (!groups.has(key)) {
+        let label;
+        if (key === "__auto__") {
+          label = "自动";
+        } else {
+          const dev = outputsCache.find((o) => o.name === key);
+          label = dev ? dev.description : key;
+        }
+        groups.set(key, { key, label, items: [] });
       }
-      btn.addEventListener("click", guard(() => selectPreset(p.file)));
-      li.appendChild(btn);
-      el.presetList.appendChild(li);
+      groups.get(key).items.push(p);
+    }
+    const ordered = [];
+    for (const o of outputsCache) {
+      if (groups.has(o.name)) ordered.push(groups.get(o.name));
+    }
+    if (groups.has("__auto__")) ordered.push(groups.get("__auto__"));
+    for (const g of groups.values()) {
+      if (!ordered.includes(g)) ordered.push(g);
+    }
+    for (const g of ordered) {
+      const groupLi = document.createElement("li");
+      groupLi.className = "preset-group";
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className =
+        "preset-group-head" + (collapsedGroups.has(g.key) ? " is-collapsed" : "");
+      head.title =
+        g.key === "__auto__"
+          ? "输出目标未指定的预设（可拖拽到其他组归类）"
+          : g.label + "（拖拽预设到此归类）";
+      const caret = document.createElement("span");
+      caret.className = "g-caret";
+      caret.textContent = "▾";
+      const gname = document.createElement("span");
+      gname.className = "g-name";
+      gname.textContent = g.label;
+      const count = document.createElement("span");
+      count.className = "g-count";
+      count.textContent = `${g.items.length}`;
+      head.append(caret, gname, count);
+      head.addEventListener("click", () => {
+        if (collapsedGroups.has(g.key)) collapsedGroups.delete(g.key);
+        else collapsedGroups.add(g.key);
+        renderPresets();
+      });
+      groupLi.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        groupLi.classList.add("drop-target");
+      });
+      groupLi.addEventListener("dragleave", (e) => {
+        if (!groupLi.contains(e.relatedTarget)) {
+          groupLi.classList.remove("drop-target");
+        }
+      });
+      groupLi.addEventListener("drop", guard(async (e) => {
+        e.preventDefault();
+        groupLi.classList.remove("drop-target");
+        const file =
+          (e.dataTransfer && e.dataTransfer.getData("text/plain")) || dragPresetFile;
+        if (!file) return;
+        const p = presets.find((x) => x.file === file);
+        if (!p) return;
+        const wantTarget = g.key === "__auto__" ? null : g.key;
+        if ((p.target || null) === wantTarget) return;
+        await api("/api/eq/output-target", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file,
+            target: g.key === "__auto__" ? "auto" : g.key,
+          }),
+        });
+        toast(`「${p.description}」已归入 ${g.label}`);
+        await refreshPresets();
+        syncOutputSelect();
+      }));
+      groupLi.appendChild(head);
+      if (!collapsedGroups.has(g.key)) {
+        const ul = document.createElement("ul");
+        ul.className = "preset-sub-list";
+        for (const p of g.items) ul.appendChild(buildPresetItem(p));
+        groupLi.appendChild(ul);
+      }
+      el.presetList.appendChild(groupLi);
     }
   }
 
@@ -343,6 +542,7 @@
     eqData = await api("/api/eq?file=" + encodeURIComponent(file));
     currentFile = eqData.file || file;
     renderPresets();
+    syncOutputSelect();
     buildEditor();
     await updateCurve();
   }
@@ -354,6 +554,26 @@
       toast(e.message || String(e), true);
     }
   }
+
+  el.outputTarget.addEventListener("change", guard(async () => {
+    if (!currentFile) return;
+    const target = el.outputTarget.value;
+    el.outputTarget.disabled = true;
+    try {
+      await api("/api/eq/output-target", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: currentFile, target }),
+      });
+      const dev = outputsCache.find((o) => o.name === target);
+      const label = target === "auto" ? "自动" : (dev ? dev.description : target);
+      toast(`输出目标已设为 ${label}`);
+      await refreshPresets();
+      syncOutputSelect();
+    } finally {
+      el.outputTarget.disabled = false;
+    }
+  }));
 
   let deleteArmed = false;
   let deleteTimer = null;
@@ -763,10 +983,336 @@
 
   window.addEventListener("resize", () => drawCurve());
 
+  // ---------- 耳机模拟 ----------
+  // 先用测量源约束两副耳机 (从结构上避免跨源混用), 再跑 DSP。
+  // 拟合要 5~15 秒, 所以走后台任务 + 轮询, 不阻塞面板。
+  const simEl = {
+    root: $("sim-root"),
+    backdrop: $("sim-backdrop"),
+    close: $("sim-close"),
+    open: $("preset-sim"),
+    source: $("sim-source"),
+    from: $("sim-from"),
+    fromSearch: $("sim-from-search"),
+    to: $("sim-to"),
+    toSearch: $("sim-to-search"),
+    findInput: $("sim-find-input"),
+    findBtn: $("sim-find-btn"),
+    findResult: $("sim-find-result"),
+    bands: $("sim-bands"),
+    treble: $("sim-treble"),
+    bass: $("sim-bass"),
+    run: $("sim-run"),
+    status: $("sim-status"),
+    metrics: $("sim-metrics"),
+    name: $("sim-name"),
+    preamp: $("sim-preamp"),
+    create: $("sim-create"),
+    fill: $("sim-fill"),
+  };
+
+  const sim = {
+    sourcesLoaded: false,
+    headphones: [],
+    result: null,
+    job: null,
+    timer: null,
+  };
+
+  function setSimStatus(text, kind) {
+    simEl.status.textContent = text || "";
+    simEl.status.className = "modal-result" + (kind ? " " + kind : "");
+  }
+
+  function openSim() {
+    simEl.root.classList.remove("hidden");
+    simEl.root.setAttribute("aria-hidden", "false");
+    if (!sim.sourcesLoaded) loadSimSources();
+    simEl.source.focus();
+  }
+
+  function closeSim() {
+    simEl.root.classList.add("hidden");
+    simEl.root.setAttribute("aria-hidden", "true");
+    if (sim.timer) {
+      clearInterval(sim.timer);
+      sim.timer = null;
+    }
+  }
+
+  async function loadSimSources() {
+    simEl.source.innerHTML = '<option value="">加载中…</option>';
+    try {
+      const data = await api("/api/sim/sources");
+      sim.sourcesLoaded = true;
+      simEl.source.innerHTML = '<option value="">— 请选择 —</option>';
+      for (const s of data.sources) {
+        const o = document.createElement("option");
+        o.value = s.name;
+        const cats = s.categories.map((c) => `${c.label}${c.count}`).join("/");
+        o.textContent = `${s.name}（${s.total} 副 · ${cats}）`;
+        simEl.source.appendChild(o);
+      }
+    } catch (e) {
+      simEl.source.innerHTML = '<option value="">加载失败</option>';
+      setSimStatus(e.message || String(e), "err");
+    }
+  }
+
+  function fillSimSelect(sel, search) {
+    const q = (search.value || "").trim().toLowerCase();
+    const list = sim.headphones.filter(
+      (h) => !q || h.name.toLowerCase().includes(q)
+    );
+    sel.innerHTML = "";
+    for (const h of list) {
+      const o = document.createElement("option");
+      o.value = h.name;
+      o.textContent = h.name;
+      o.title = `${h.category_cn} · ${h.name}`;
+      sel.appendChild(o);
+    }
+    if (!list.length) {
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = q ? "（无匹配）" : "（空）";
+      sel.appendChild(o);
+    }
+  }
+
+  async function loadSimHeadphones() {
+    const source = simEl.source.value;
+    sim.result = null;
+    simEl.metrics.classList.add("hidden");
+    simEl.create.disabled = true;
+    simEl.fill.disabled = true;
+    if (!source) {
+      sim.headphones = [];
+      fillSimSelect(simEl.from, simEl.fromSearch);
+      fillSimSelect(simEl.to, simEl.toSearch);
+      return;
+    }
+    setSimStatus("载入耳机列表…", null);
+    try {
+      const data = await api("/api/sim/headphones?source=" + encodeURIComponent(source));
+      sim.headphones = data.headphones;
+      fillSimSelect(simEl.from, simEl.fromSearch);
+      fillSimSelect(simEl.to, simEl.toSearch);
+      setSimStatus(`${sim.headphones.length} 副耳机 · 两侧列表已限制在同一测量源`, "ok");
+    } catch (e) {
+      setSimStatus(e.message || String(e), "err");
+    }
+  }
+
+  function renderSimMetrics(r) {
+    const rows = [
+      ["低频 20Hz–1k", r.metrics.low],
+      ["中频 1k–10k", r.metrics.mid],
+      ["高频 10k–20k", r.metrics.high],
+    ];
+    let html = '<div class="sim-metrics-grid">';
+    for (const [label, m] of rows) {
+      if (!m) continue;
+      html += `<div class="sim-metric"><span class="sim-metric-k">${label}</span>
+        <span class="sim-metric-v">RMS ${m.rms.toFixed(2)} dB</span>
+        <span class="sim-metric-s">max ${m.max.toFixed(2)} dB</span></div>`;
+    }
+    html += "</div>";
+    html += `<p class="sim-note">共 ${r.band_count} 段 · 预增益 ${r.preamp_db} dB · 耗时 ${r.elapsed}s
+      · 测量源 ${r.source}</p>`;
+    html += `<p class="sim-note sim-note-dim">高频误差天然偏大：10kHz 以上耳道共振因人而异，
+      测量本身就不那么可信。这是物理限制，不是算法问题。</p>`;
+    simEl.metrics.innerHTML = html;
+    simEl.metrics.classList.remove("hidden");
+  }
+
+  async function pollSim() {
+    try {
+      const d = await api("/api/sim/job?id=" + encodeURIComponent(sim.job));
+      if (d.state === "running") {
+        setSimStatus(`模拟中… 已 ${d.elapsed}s`, null);
+        return;
+      }
+      clearInterval(sim.timer);
+      sim.timer = null;
+      if (d.state === "error") {
+        setSimStatus(d.error || "模拟失败", "err");
+        return;
+      }
+      sim.result = d.result;
+      setSimStatus(`完成 · ${d.result.band_count} 段 · ${d.elapsed}s`, "ok");
+      renderSimMetrics(d.result);
+      simEl.preamp.value = d.result.preamp_db;
+      if (!simEl.name.value.trim()) {
+        simEl.name.value = `${d.result.from} → ${d.result.to}`;
+      }
+      simEl.create.disabled = false;
+      simEl.fill.disabled = false;
+    } catch (e) {
+      if (sim.timer) {
+        clearInterval(sim.timer);
+        sim.timer = null;
+      }
+      setSimStatus(e.message || String(e), "err");
+    }
+  }
+
+  simEl.open.addEventListener("click", openSim);
+  simEl.close.addEventListener("click", closeSim);
+  simEl.backdrop.addEventListener("click", closeSim);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !simEl.root.classList.contains("hidden")) closeSim();
+  });
+
+  simEl.source.addEventListener("change", guard(loadSimHeadphones));
+  simEl.fromSearch.addEventListener("input", () => fillSimSelect(simEl.from, simEl.fromSearch));
+  simEl.toSearch.addEventListener("input", () => fillSimSelect(simEl.to, simEl.toSearch));
+
+  simEl.findBtn.addEventListener("click", guard(async () => {
+    const q = simEl.findInput.value.trim();
+    if (q.length < 2) {
+      simEl.findResult.textContent = "请至少输入 2 个字符";
+      return;
+    }
+    simEl.findResult.textContent = "查找中…";
+    const data = await api("/api/sim/search?q=" + encodeURIComponent(q));
+    if (!data.hits.length) {
+      simEl.findResult.textContent = `没找到「${q}」`;
+      return;
+    }
+    // 按源聚合: 同一个源里有多条测量 (不同耳罩/版本) 时一并列出
+    const bySource = new Map();
+    for (const h of data.hits) {
+      if (!bySource.has(h.source)) bySource.set(h.source, []);
+      bySource.get(h.source).push(h);
+    }
+    simEl.findResult.innerHTML = "";
+    for (const [source, hits] of bySource) {
+      const row = document.createElement("div");
+      row.className = "sim-find-row-item";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-ghost btn-sm";
+      btn.textContent = "用这个源";
+      btn.addEventListener("click", guard(async () => {
+        simEl.source.value = source;
+        await loadSimHeadphones();
+        setSimStatus(`已切到测量源「${source}」`, "ok");
+      }));
+      const label = document.createElement("span");
+      label.innerHTML = `<b>${source}</b> · ${hits.length} 条：` +
+        hits.slice(0, 3).map((h) => h.name).join("、") +
+        (hits.length > 3 ? " …" : "");
+      row.appendChild(btn);
+      row.appendChild(label);
+      simEl.findResult.appendChild(row);
+    }
+    const note = document.createElement("p");
+    note.className = "sim-note sim-note-dim";
+    note.textContent = "两副耳机都出现在同一个源里，才能安全互模拟。";
+    simEl.findResult.appendChild(note);
+  }));
+
+  simEl.run.addEventListener("click", guard(async () => {
+    const source = simEl.source.value;
+    const from = simEl.from.value;
+    const to = simEl.to.value;
+    if (!source) {
+      setSimStatus("请先选择测量源", "err");
+      return;
+    }
+    if (!from || !to) {
+      setSimStatus("请选择两副耳机", "err");
+      return;
+    }
+    if (from === to) {
+      setSimStatus("源耳机与目标耳机不能相同", "err");
+      return;
+    }
+    simEl.run.disabled = true;
+    simEl.create.disabled = true;
+    simEl.fill.disabled = true;
+    simEl.metrics.classList.add("hidden");
+    setSimStatus("已提交，正在拟合…", null);
+    try {
+      const r = await api("/api/sim/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source,
+          from,
+          to,
+          bands: Number(simEl.bands.value) || 10,
+          treble_mode: simEl.treble.value,
+          bass_boost: Number(simEl.bass.value) || 0,
+        }),
+      });
+      sim.job = r.job;
+      if (sim.timer) clearInterval(sim.timer);
+      sim.timer = setInterval(guard(pollSim), 1000);
+    } catch (e) {
+      setSimStatus(e.message || String(e), "err");
+    } finally {
+      simEl.run.disabled = false;
+    }
+  }));
+
+  simEl.create.addEventListener("click", guard(async () => {
+    if (!sim.result) return;
+    const name = simEl.name.value.trim();
+    if (!name) {
+      setSimStatus("请填写预设名称", "err");
+      return;
+    }
+    simEl.create.disabled = true;
+    try {
+      const resp = await api("/api/eq/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          preamp_db: Number(simEl.preamp.value),
+          bands: sim.result.bands,
+        }),
+      });
+      closeSim();
+      toast(`已创建预设「${resp.description}」（音频会闪断一下）`);
+      currentFile = resp.file;
+      await refreshPresets();
+      await loadPreset(resp.file);
+      setTimeout(guard(async () => {
+        await refreshStatus();
+        await refreshPresets();
+      }), 1500);
+      setTimeout(guard(async () => {
+        await refreshStatus();
+        await refreshPresets();
+      }), 4000);
+    } catch (e) {
+      simEl.create.disabled = false;
+      setSimStatus(e.message || String(e), "err");
+    }
+  }));
+
+  simEl.fill.addEventListener("click", () => {
+    if (!sim.result) return;
+    eqData = {
+      file: currentFile,
+      description: simEl.name.value.trim() || "模拟结果",
+      preamp_db: Number(simEl.preamp.value),
+      bands: sim.result.bands.map((b) => ({ ...b })),
+    };
+    buildEditor();
+    updateCurve();
+    closeSim();
+    toast("已填入编辑器，点击「应用」保存");
+  });
+
   // ---------- init ----------
   (async () => {
     el.preamp.addEventListener("input", scheduleCurve);
     try {
+      await refreshOutputs();
       await refreshPresets();
       if (currentFile) await loadPreset(currentFile);
     } catch (e) {
@@ -777,8 +1323,11 @@
     } catch (e) {
       toast(e.message || String(e), true);
     }
-    if (new URLSearchParams(location.search).get("modal") === "create") {
+    const wanted = new URLSearchParams(location.search).get("modal");
+    if (wanted === "create") {
       openModal("create");
+    } else if (wanted === "sim") {
+      openSim();
     }
     // refresh status periodically (service badge, default sink drift)
     setInterval(guard(refreshStatus), 10000);

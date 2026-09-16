@@ -15,6 +15,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+try:                                    # 模拟器是可选功能, 缺依赖时面板仍可用
+    import sim as sim_mod
+except Exception:                       # noqa: BLE001
+    sim_mod = None
+
 HOST = "127.0.0.1"
 PORT = 8787
 
@@ -32,8 +37,22 @@ EQ_OUTPUT_PREFIX = "effect_output."
 SERVICE_UNIT = "filter-chain.service"
 
 MAX_BODY = 64 * 1024
+
+# 段数 / 参数取值范围。
+# 注意: PipeWire 本身**没有**这些限制 —— 实测 filter-chain 加载 256 段、Q=100
+# 均正常。这里的边界只用于挡住明显异常的数据, 不是技术上限。
+# 唯一实际约束是性能: suggest_preamp() 耗时随段数线性增长
+# (32 段≈1.0s, 64 段≈2.1s, 128 段≈4.1s), 段数过大会让面板明显变卡。
 MIN_BANDS = 1
-MAX_BANDS = 32
+MAX_BANDS = 128
+MIN_FREQ = 10.0
+MAX_FREQ = 22000.0          # 44.1kHz 的 Nyquist = 22050Hz
+MIN_Q = 0.1
+MAX_Q = 50.0
+MIN_GAIN = -24.0
+MAX_GAIN = 24.0
+MIN_PREAMP = -24.0
+MAX_PREAMP = 0.0
 
 # Serialize request handling: concurrent pw-dump/pw-link/wpctl invocations
 # can race and produce corrupted output. Single-user panel, so serialization
@@ -341,9 +360,16 @@ def forget_preset_volume(node_name):
 
 def physical_for_mode(default_name, sinks):
     """The physical device whose volume belongs to the mode keyed by
-    default_name: the downstream of an EQ default, the default itself in
-    direct mode, else the first physical sink."""
+    default_name. For EQ modes prefer the preset's configured output target
+    (stable across WirePlumber re-routing), then the live downstream, then
+    the first physical sink. Direct modes return the device itself."""
     if is_eq_name(default_name):
+        tname = output_target_map().get(default_name)
+        if tname:
+            hit = next((s for s in sinks
+                        if s["name"] == tname and not is_eq_name(s["name"])), None)
+            if hit is not None:
+                return hit
         physical = downstream_of(default_name, parse_pw_links(), sinks)
         if physical is None:
             phys = physical_sinks(sinks)
@@ -393,6 +419,34 @@ def forget_family_volume(node_name):
         save_state(state)
 
 
+def output_target_map():
+    """Per-preset output routing: {preset node.name: physical sink node.name}."""
+    mem = load_state().get("output_targets")
+    return dict(mem) if isinstance(mem, dict) else {}
+
+
+def set_output_target(node_name, target):
+    """Persist a preset's output target; target=None clears it (auto)."""
+    state = load_state()
+    mem = state.setdefault("output_targets", {})
+    if target:
+        mem[node_name] = target
+    else:
+        mem.pop(node_name, None)
+    save_state(state)
+
+
+def forget_output_target(node_name):
+    """Drop a preset's output target (on preset deletion)."""
+    if not node_name:
+        return
+    state = load_state()
+    mem = state.get("output_targets")
+    if isinstance(mem, dict) and node_name in mem:
+        mem.pop(node_name)
+        save_state(state)
+
+
 def capture_eq_memory(sinks):
     """If the current default is an EQ, remember its live device volume
     (captures panel and external e.g. GNOME changes) before a switch."""
@@ -416,11 +470,45 @@ def after_default_switch(target):
         fresh = next((s for s in sinks if s["name"] == target["name"]), None)
         if fresh is not None:
             apply_preset_volume(fresh)
-    apply_family_memory(target["name"], sinks)
     repair_links()
+    apply_family_memory(target["name"], list_sinks())
 
 
 # ---------------------------------------------------------------- link repair
+
+def output_target_for(out_name, targets, phys_by_name, auto_sink):
+    """Desired physical sink for an effect_output stream: the preset's
+    configured target when valid, else the auto default."""
+    preset_name = EQ_INPUT_PREFIX + out_name[len(EQ_OUTPUT_PREFIX):]
+    tname = targets.get(preset_name)
+    if tname:
+        configured = phys_by_name.get(tname)
+        if configured is not None:
+            return configured
+    return auto_sink
+
+
+def align_output_stream(data, links, out_name, out_id, target):
+    """Make effect_output.<x> connect ONLY to `target`'s playback ports.
+    Returns (disconnected, connected)."""
+    disc = conn = 0
+    for src, dst in links:
+        if port_node(src) == out_name and port_node(dst) != target["name"]:
+            rc, _, _ = run(["pw-link", "-d", src, dst])
+            if rc == 0:
+                disc += 1
+    linked = {d for s, d in links
+              if port_node(s) == out_name and port_node(d) == target["name"]}
+    out_ports = node_port_names(data, out_id, "output")
+    tports = node_port_names(data, target["id"], "playback")
+    for op, tp in _pair_ports(out_ports, tports):
+        full = f"{target['name']}:{tp}"
+        if full not in linked:
+            rc, _, _ = run(["pw-link", f"{out_name}:{op}", full])
+            if rc == 0:
+                conn += 1
+    return disc, conn
+
 
 def repair_links():
     """Fix routing: no virtual->virtual EQ links; every effect_output stream
@@ -428,6 +516,7 @@ def repair_links():
     """
     fixed = {"disconnected": 0, "reconnected": 0}
     clean = False
+    targets = output_target_map()
     for _ in range(2):
         links = parse_pw_links()
         for src, dst in links:
@@ -442,6 +531,7 @@ def repair_links():
 
         data = pw_dump()
         sinks = _sinks_from_dump(data)
+        phys_by_name = {s["name"]: s for s in physical_sinks(sinks)}
         out_nodes = {}
         for obj in data:
             if obj.get("type") != "PipeWire:Interface:Node":
@@ -450,38 +540,48 @@ def repair_links():
             name = props.get("node.name") or ""
             if name.startswith(EQ_OUTPUT_PREFIX):
                 out_nodes[name] = obj["id"]
-        linked = {port_node(s) for s, _ in links
-                  if port_node(s).startswith(EQ_OUTPUT_PREFIX)}
-        orphans = sorted(n for n in out_nodes if n not in linked)
 
-        if orphans:
-            try:
-                dname, _ = default_node_name()
-            except ApiError:
-                dname = None
-            target = downstream_of(dname, links, sinks) if dname else None
+        if not out_nodes or not phys_by_name:
+            break
+
+        try:
+            dname, _ = default_node_name()
+        except ApiError:
+            dname = None
+        auto = downstream_of(dname, links, sinks) if dname else None
+        if auto is None:
+            auto = physical_sinks(sinks)[0]
+
+        round_fixed = 0
+        for out_name, out_id in sorted(out_nodes.items()):
+            target = output_target_for(out_name, targets, phys_by_name, auto)
             if target is None:
-                phys = physical_sinks(sinks)
-                target = phys[0] if phys else None
-            if target is None:
-                break
-            tports = node_port_names(data, target["id"], "playback")
-            for name in orphans:
-                oports = node_port_names(data, out_nodes[name], "output")
-                for op, tp in _pair_ports(oports, tports):
-                    rc, _, _ = run(
-                        ["pw-link", f"{name}:{op}", f"{target['name']}:{tp}"])
-                    if rc == 0:
-                        fixed["reconnected"] += 1
+                continue
+            links_now = parse_pw_links()
+            d, c = align_output_stream(data, links_now, out_name, out_id, target)
+            fixed["disconnected"] += d
+            fixed["reconnected"] += c
+            round_fixed += d + c
+        if round_fixed:
             time.sleep(0.4)
-            links = parse_pw_links()
 
-        linked = {port_node(s) for s, _ in links
-                  if port_node(s).startswith(EQ_OUTPUT_PREFIX)}
+        links = parse_pw_links()
         bad_v2v = any(
             port_node(d).startswith(EQ_INPUT_PREFIX)
             for s, d in links if port_node(s).startswith(EQ_OUTPUT_PREFIX))
-        clean = (not bad_v2v) and out_nodes.keys() <= linked
+        all_ok = True
+        for out_name in out_nodes:
+            peers = {port_node(d) for s, d in links if port_node(s) == out_name}
+            if not peers:
+                all_ok = False
+                break
+            target = output_target_for(out_name, targets, phys_by_name, auto)
+            if target is None:
+                continue
+            if peers != {target["name"]}:
+                all_ok = False
+                break
+        clean = (not bad_v2v) and all_ok
         if clean:
             break
     return {"ok": True, "fixed": fixed, "links_clean": clean}
@@ -626,6 +726,7 @@ def list_presets():
         default_name, _ = default_node_name()
     except ApiError:
         default_name = None
+    targets = output_target_map()
     presets = []
     for f in files:
         try:
@@ -638,6 +739,7 @@ def list_presets():
             "description": info["description"],
             "bands": len(info["bands"]),
             "node_name": info["node_name"],
+            "target": targets.get(info["node_name"]),
             "sink": (
                 {"id": sink["id"], "loaded": True, "is_default": sink["name"] == default_name}
                 if sink else None
@@ -666,12 +768,12 @@ def _validate_eq(payload):
             gain = float(b["gain"])
         except (KeyError, TypeError, ValueError):
             raise ApiError(f"第 {i} 段参数缺失或非法", 400)
-        if not (10.0 <= freq <= 22000.0):
-            raise ApiError(f"第 {i} 段频率超出范围 (10 ~ 22000 Hz)", 400)
-        if not (0.1 <= q <= 20.0):
-            raise ApiError(f"第 {i} 段 Q 超出范围 (0.1 ~ 20)", 400)
-        if not (-24.0 <= gain <= 24.0):
-            raise ApiError(f"第 {i} 段增益超出范围 (-24 ~ +24 dB)", 400)
+        if not (MIN_FREQ <= freq <= MAX_FREQ):
+            raise ApiError(f"第 {i} 段频率超出范围 ({MIN_FREQ:g} ~ {MAX_FREQ:g} Hz)", 400)
+        if not (MIN_Q <= q <= MAX_Q):
+            raise ApiError(f"第 {i} 段 Q 超出范围 ({MIN_Q:g} ~ {MAX_Q:g})", 400)
+        if not (MIN_GAIN <= gain <= MAX_GAIN):
+            raise ApiError(f"第 {i} 段增益超出范围 ({MIN_GAIN:g} ~ {MAX_GAIN:+g} dB)", 400)
         btype = b.get("type", "peaking")
         if btype not in TYPE_TO_LABEL:
             raise ApiError(f"第 {i} 段滤波类型非法: {btype}", 400)
@@ -830,12 +932,12 @@ def parse_eq_text(text):
     if not (MIN_BANDS <= len(bands) <= MAX_BANDS):
         raise ApiError(f"波段数量必须在 {MIN_BANDS}~{MAX_BANDS} 之间, 实际 {len(bands)}", 400)
     for i, b in enumerate(bands, 1):
-        if not (10.0 <= b["freq"] <= 22000.0):
-            raise ApiError(f"第 {i} 段频率超出范围 (10 ~ 22000 Hz)", 400)
-        if not (0.1 <= b["q"] <= 20.0):
-            raise ApiError(f"第 {i} 段 Q 超出范围 (0.1 ~ 20)", 400)
-        if not (-24.0 <= b["gain"] <= 24.0):
-            raise ApiError(f"第 {i} 段增益超出范围 (-24 ~ +24 dB)", 400)
+        if not (MIN_FREQ <= b["freq"] <= MAX_FREQ):
+            raise ApiError(f"第 {i} 段频率超出范围 ({MIN_FREQ:g} ~ {MAX_FREQ:g} Hz)", 400)
+        if not (MIN_Q <= b["q"] <= MAX_Q):
+            raise ApiError(f"第 {i} 段 Q 超出范围 ({MIN_Q:g} ~ {MAX_Q:g})", 400)
+        if not (MIN_GAIN <= b["gain"] <= MAX_GAIN):
+            raise ApiError(f"第 {i} 段增益超出范围 ({MIN_GAIN:g} ~ {MAX_GAIN:+g} dB)", 400)
     preamp, warnings = suggest_preamp(bands)
     return {"bands": bands, "count": len(bands), "preamp_suggested_db": preamp,
             "warnings": warnings}
@@ -983,10 +1085,40 @@ def delete_preset(body):
     p.unlink()
     forget_preset_volume(node_name)
     forget_family_volume(node_name)
+    forget_output_target(node_name)
     must_run(["systemctl", "--user", "restart", SERVICE_UNIT])
     time.sleep(0.5)
     repair_links()
     return {"ok": True}
+
+
+def set_preset_output_target(body):
+    """Persist a preset's output target and align its routing immediately."""
+    p = preset_path(body.get("file"))
+    target = body.get("target")
+    if target in (None, "", "auto"):
+        tname = None
+    elif isinstance(target, str):
+        tname = target
+    else:
+        raise ApiError("target 必须是输出设备名或 auto", 400)
+    info = read_preset(p)
+    node_name = info["node_name"]
+    if not node_name:
+        raise ApiError("预设缺少 node.name", 500)
+    sinks = list_sinks()
+    phys = {s["name"]: s for s in physical_sinks(sinks)}
+    if tname is not None and tname not in phys:
+        raise ApiError("输出设备不存在", 400)
+    set_output_target(node_name, tname)
+    result = repair_links()
+    return {
+        "ok": True,
+        "file": info["file"],
+        "node_name": node_name,
+        "target": tname,
+        "links_clean": result.get("links_clean", False),
+    }
 
 
 # ---------------------------------------------------------------- routes
@@ -1032,6 +1164,29 @@ def record_default_choice(sink):
     else:
         state["last_non_eq_default"] = {"id": sink["id"], "name": sink["name"]}
     save_state(state)
+
+
+# ---------------------------------------------------------------- 耳机模拟
+
+def require_sim():
+    if sim_mod is None:
+        raise ApiError("耳机模拟不可用: 缺少 sim.py 或 numpy/scipy", 503)
+    return sim_mod
+
+
+def sim_get(fname, *args, **kwargs):
+    """调用 sim 模块的 fname。
+
+    注意: 这里必须传**函数名**而不是 `sim_mod.foo` 这样的属性引用 ——
+    后者会在进入本函数前就求值, sim_mod 为 None 时会抛 AttributeError
+    (变成 500), 而不是给出可读的 503。
+    """
+    s = require_sim()
+    fn = getattr(s, fname)
+    try:
+        return fn(*args, **kwargs)
+    except s.SimError as e:
+        raise ApiError(str(e), 400)
 
 
 def handle_post(path, body):
@@ -1087,6 +1242,42 @@ def handle_post(path, body):
     if path == "/api/eq/delete":
         return delete_preset(body)
 
+    if path == "/api/eq/output-target":
+        return set_preset_output_target(body)
+
+    if path == "/api/sim/common":
+        return sim_get("common_sources",
+                       str(body.get("from") or ""), str(body.get("to") or ""))
+
+    if path == "/api/sim/run":
+        source = str(body.get("source") or "").strip()
+        name_from = str(body.get("from") or "").strip()
+        name_to = str(body.get("to") or "").strip()
+        if not (source and name_from and name_to):
+            raise ApiError("需要 source / from / to 三个字段", 400)
+        if name_from == name_to:
+            raise ApiError("源耳机与目标耳机不能相同", 400)
+        try:
+            bands = int(body.get("bands", 10))
+        except (TypeError, ValueError):
+            raise ApiError("bands 必须是整数", 400)
+        if not (MIN_BANDS <= bands <= MAX_BANDS):
+            raise ApiError(f"段数需在 {MIN_BANDS}~{MAX_BANDS} 之间", 400)
+        treble = body.get("treble_mode", "shelf")
+        if treble not in ("shelf", "ignore", "match"):
+            raise ApiError("treble_mode 必须是 shelf/ignore/match", 400)
+        try:
+            bass = float(body.get("bass_boost", 0.0))
+        except (TypeError, ValueError):
+            raise ApiError("bass_boost 必须是数字", 400)
+        if not (-24.0 <= bass <= 24.0):
+            raise ApiError("bass_boost 超出 ±24 dB", 400)
+
+        jid = sim_get("start_sim_job",
+                      source=source, name_from=name_from, name_to=name_to,
+                      bands=bands, treble_mode=treble, bass_boost=bass)
+        return {"job": jid}
+
     if path == "/api/service":
         action = body.get("action")
         if action not in ("start", "stop", "restart"):
@@ -1127,13 +1318,7 @@ def handle_post(path, body):
             eq_sink = next((s for s in sinks if s["name"] == default_name), None)
         if scope == "eq" and not via_eq:
             raise ApiError("当前默认输出不是 EQ 设备", 400)
-        if via_eq:
-            physical = downstream_of(default_name, parse_pw_links(), sinks)
-            if physical is None:
-                phys = physical_sinks(sinks)
-                physical = phys[0] if phys else None
-        else:
-            physical = next((s for s in sinks if s["name"] == default_name), None)
+        physical = physical_for_mode(default_name, sinks)
         if value is not None:
             if scope == "eq":
                 if eq_sink is None:
@@ -1227,6 +1412,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(status_payload())
             if path == "/api/eqs":
                 return self._send_json(list_presets())
+            if path == "/api/outputs":
+                sinks = list_sinks()
+                return self._send_json({"outputs": [
+                    {"id": s["id"], "name": s["name"], "description": s["description"]}
+                    for s in physical_sinks(sinks)
+                ]})
+            if path == "/api/sim/sources":
+                return self._send_json(
+                    {"sources": sim_get("list_sources")})
+            if path == "/api/sim/headphones":
+                src = (query.get("source") or [""])[0]
+                if not src:
+                    raise ApiError("缺少 source 参数", 400)
+                return self._send_json(
+                    {"headphones": sim_get("list_headphones", src)})
+            if path == "/api/sim/search":
+                q = (query.get("q") or [""])[0]
+                return self._send_json(
+                    {"hits": sim_get("search_headphone", q)})
+            if path == "/api/sim/job":
+                jid = (query.get("id") or [""])[0]
+                if not jid:
+                    raise ApiError("缺少 id 参数", 400)
+                return self._send_json(sim_get("job_status", jid))
             if path == "/api/eq":
                 file = (query.get("file") or [None])[0]
                 if file:
@@ -1273,6 +1482,9 @@ def main():
     except Exception:  # noqa: BLE001 - startup repair is best-effort
         pass
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+    # 预热测量索引 (首次需一次网络请求), 放后台避免拖慢启动
+    if sim_mod is not None:
+        threading.Thread(target=sim_mod.warm_index, daemon=True).start()
     print(f"eq-web listening on http://{HOST}:{PORT}", flush=True)
     try:
         server.serve_forever()

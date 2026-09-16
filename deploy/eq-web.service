@@ -3,7 +3,11 @@ Description=EQ Web Control Panel (HE400se PARA II)
 After=pipewire.service wireplumber.service
 
 [Service]
-ExecStart=/usr/bin/python3 /home/mak1ma/eq-web/server.py
+# 必须用项目自带 venv: 系统 /usr/bin/python3 没有 numpy/scipy,
+# 而耳机模拟功能 (fr_core) 需要它们。
+# 重建 venv:
+#   cd ~/eq-web && /usr/bin/python3 -m venv .venv && .venv/bin/pip install numpy scipy
+ExecStart=/home/mak1ma/eq-web/.venv/bin/python3 /home/mak1ma/eq-web/server.py
 Restart=on-failure
 
 [Install]

@@ -56,14 +56,44 @@ systemctl --user enable --now eq-web.service
 | `static/index.html` | 页面标题 |
 | `deploy/eq-web.service` / `deploy/eq-panel.desktop` | `/home/mak1ma` 路径 |
 
+## 耳机模拟（已并入本项目）
+
+面板内置「🎧 模拟耳机」：选两副耳机 → 自动算 EQ → 一键建预设。
+入口在左侧 **EQ 预设** 卡片的 **🎧 模拟耳机** 按钮。
+
+| 文件 | 作用 |
+|---|---|
+| `sim.py` | 后端：测量库索引 + 频响缓存 + 异步模拟任务 + 6 个 `/api/sim/*` 接口 |
+| `fr_core.py` | DSP 引擎：FR 插值/平滑、RBJ 双二阶、参数 EQ 拟合、FIR 设计 |
+| `hp_emulate.py` | 同引擎的命令行版（可选，脚本化时用） |
+| `verify_fir.py` | 卷积 FIR 校验工具 |
+| `measurements/` | 几个样例频响（CLI 示例用） |
+| `SIMULATION.md` | 引擎与算法完整说明（原理、实测数据、踩过的坑） |
+
+**依赖**：模拟需要 `numpy` + `scipy`。系统 `/usr/bin/python3` 默认没有，
+所以服务必须用项目自带 venv：
+
+```bash
+cd ~/eq-web && /usr/bin/python3 -m venv .venv && .venv/bin/pip install numpy scipy
+```
+
+面板的**索引 / 搜索 / 找同源**是纯标准库实现，缺 numpy 也能用；
+只有真正做 DSP 的 `/api/sim/run` 需要 numpy/scipy。
+
 ## 文件结构
 
 ```
 eq-web/
-├── server.py              # 后端（Python 标准库 HTTP 服务）
+├── server.py              # 后端（Python 标准库 HTTP 服务）+ /api/sim/* 接口
+├── sim.py                 # 耳机模拟后端（索引/缓存/异步任务）
+├── fr_core.py             # DSP 引擎（numpy + scipy）
+├── hp_emulate.py          # 同引擎的命令行版
+├── verify_fir.py          # 卷积 FIR 校验
+├── measurements/          # 样例频响数据
+├── SIMULATION.md          # 引擎与算法完整说明
 ├── start.sh               # 启动脚本
 ├── static/
-│   ├── index.html         # 前端页面
+│   ├── index.html         # 前端页面（含模拟模态框）
 │   ├── app.js             # 前端逻辑
 │   └── style.css          # 样式
 ├── docs/
@@ -75,4 +105,5 @@ eq-web/
 
 ## 技术栈
 
-PipeWire filter-chain（bq_peaking）· Python 3 标准库 · Web Audio API
+PipeWire filter-chain（bq_peaking / bq_lowshelf / bq_highshelf）· Python 3 标准库
+（模拟部分额外需要 numpy + scipy）· Web Audio API
